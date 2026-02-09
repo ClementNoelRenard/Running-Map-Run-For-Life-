@@ -7,5 +7,6 @@ plusieurs idées d'evolution :
  - Tableau des scores
  - Refonte de la mise en forme
  - rajout de son en plus de la vibration
+ - map en 3d
  - Visualisation du tracet de parcours effectuée + option de partage en .png (avec temps et distance)
  - Amelioration du mode "hors ligne" , En l'état quand, Il y a une perte du serveur OSM, Les zombies passent en mode marche dégradée, Et fonce tout droit sur le joueur.
