@@ -91,7 +91,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="ZOMBIE\nSURVIVAL"
+                android:text="RunningMap\n Run for your life !"
                 android:textAlignment="center"
                 android:textColor="#B3261E"
                 android:textSize="48sp"
