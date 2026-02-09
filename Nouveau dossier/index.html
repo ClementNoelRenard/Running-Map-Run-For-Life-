@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Zombie Run Web</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; overflow: hidden; background: #000; }
+        #map { height: 100vh; width: 100vw; z-index: 1; }
+        
+        /* FILTRE SOMBRE POUR AMBIANCE ZOMBIE */
+        .leaflet-layer { filter: brightness(0.6) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7); }
+
+        /* INTERFACE (HUD) */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 1000; pointer-events: none;
+            display: flex; flex-direction: column; justify-content: space-between;
+        }
+        
+        .hud-bar {
+            background: rgba(0,0,0,0.8); color: white; padding: 10px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        
+        .stat-box { text-align: center; }
+        .big-text { font-size: 20px; font-weight: bold; display: block; }
+        .small-text { font-size: 12px; color: #aaa; }
+        
+        .status-silent { color: #00ff00; }
+        .status-loud { color: #ff0000; animation: pulse 0.5s infinite; }
+
+        #start-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9); z-index: 2000;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            color: white; pointer-events: all;
+        }
+
+        button {
+            background: #d32f2f; color: white; border: none; padding: 15px 30px;
+            font-size: 20px; font-weight: bold; border-radius: 5px; margin-top: 20px;
+        }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <div id="start-screen">
+        <h1 style="color: red; font-size: 40px;">ZOMBIE RUN</h1>
+        <p>Marche doucement (< 5km/h) pour être invisible.</p>
+        <p>Récupère 5 sacs.</p>
+        <button onclick="startGame()">SURVIVRE</button>
+    </div>
+
+    <div id="ui-layer" style="display: none;">
+        <div class="hud-bar" style="align-items: flex-start;">
+            <div>
+                <span id="speed-display" class="big-text">0.0 km/h</span>
+                <span id="noise-display" class="small-text status-silent">SILENCIEUX</span>
+            </div>
+            <div style="text-align: right;">
+                <span id="timer" class="big-text">00:00</span>
+                <span id="lives" class="big-text" style="color: red;">❤❤❤</span>
+            </div>
+        </div>
+
+        <div class="hud-bar">
+            <span class="big-text">OBJECTIFS</span>
+            <span id="score" class="big-text" style="font-size: 30px;">0 / 5</span>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        // CONFIGURATION
+        const ZOMBIE_COUNT = 500;
+        const GAME_RADIUS = 0.02; // Environ 2-3km
+        const DETECTION_SILENT = 0.00015; // 15m
+        const DETECTION_LOUD = 0.00150; // 150m
+        const SPEED_THRESHOLD = 5.0; // km/h
+
+        // VARIABLES
+        let map, playerMarker, playerCircle;
+        let zombies = [];
+        let objectives = [];
+        let gameRunning = false;
+        let lives = 3;
+        let score = 0;
+        let startTime;
+        let playerPos = null;
+        let lastPos = null;
+        let lastTime = null;
+        let extractionMarker = null;
+
+        // ICONS
+        const iconZombie = L.divIcon({ html: '<i class="fas fa-circle" style="color:red; font-size:12px;"></i>', className: 'dummy' });
+        const iconPlayer = L.divIcon({ html: '<i class="fas fa-circle" style="color:cyan; font-size:16px; border: 2px solid white; border-radius: 50%;"></i>', className: 'dummy' });
+        const iconBag = L.divIcon({ html: '<i class="fas fa-shopping-bag" style="color:#00ff00; font-size:24px;"></i>', className: 'dummy' });
+        const iconExit = L.divIcon({ html: '<i class="fas fa-flag-checkered" style="color:white; font-size:30px;"></i>', className: 'dummy' });
+
+        // 1. INITIALISATION
+        function initMap() {
+            map = L.map('map', { zoomControl: false }).setView([48.8566, 2.3522], 18);
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; OSM contributors'
+            }).addTo(map);
+        }
+
+        function startGame() {
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('ui-layer').style.display = 'flex';
+            
+            if (navigator.geolocation) {
+                // Suivi GPS haute précision
+                navigator.geolocation.watchPosition(updatePosition, handleError, {
+                    enableHighAccuracy: true,
+                    maximumAge: 1000,
+                    timeout: 5000
+                });
+                gameRunning = true;
+                startTime = Date.now();
+                setInterval(gameLoop, 500); // Boucle de jeu (2 fois par seconde)
+                setInterval(updateTimer, 1000);
+            } else {
+                alert("GPS non supporté !");
+            }
+        }
+
+        // 2. MISE A JOUR JOUEUR (GPS)
+        function updatePosition(position) {
+            const lat = position.coords.latitude;
+            const lng = position.coords.longitude;
+            const speed = position.coords.speed ? (position.coords.speed * 3.6) : 0; // m/s -> km/h
+
+            playerPos = { lat, lng };
+
+            // Mise à jour Carte
+            if (!playerMarker) {
+                map.setView([lat, lng], 18);
+                playerMarker = L.marker([lat, lng], {icon: iconPlayer}).addTo(map);
+                spawnGameElements(lat, lng);
+            } else {
+                playerMarker.setLatLng([lat, lng]);
+            }
+
+            // Mise à jour HUD Vitesse
+            document.getElementById('speed-display').innerText = speed.toFixed(1) + " km/h";
+            const noiseLabel = document.getElementById('noise-display');
+            
+            if (speed > SPEED_THRESHOLD) {
+                noiseLabel.innerText = "BRUYANT !!!";
+                noiseLabel.className = "small-text status-loud";
+                playerMarker.detectionRadius = DETECTION_LOUD;
+            } else {
+                noiseLabel.innerText = "SILENCIEUX";
+                noiseLabel.className = "small-text status-silent";
+                playerMarker.detectionRadius = DETECTION_SILENT;
+            }
+        }
+
+        // 3. CREATION DU MONDE
+        function spawnGameElements(lat, lng) {
+            // Zombies
+            for(let i=0; i<ZOMBIE_COUNT; i++) {
+                const zLat = lat + (Math.random() - 0.5) * GAME_RADIUS;
+                const zLng = lng + (Math.random() - 0.5) * GAME_RADIUS;
+                const marker = L.marker([zLat, zLng], {icon: iconZombie}).addTo(map);
+                zombies.push({
+                    marker: marker,
+                    state: 'WANDERING',
+                    speed: 0.00002 + Math.random() * 0.00002 // Vitesse aléatoire
+                });
+            }
+
+            // Objectifs
+            for(let i=0; i<5; i++) {
+                const oLat = lat + (Math.random() - 0.5) * 0.01; // ~1km max
+                const oLng = lng + (Math.random() - 0.5) * 0.01;
+                const marker = L.marker([oLat, oLng], {icon: iconBag}).addTo(map);
+                objectives.push(marker);
+            }
+        }
+
+        // 4. BOUCLE DE JEU (INTELLIGENCE ARTIFICIELLE)
+        function gameLoop() {
+            if (!playerPos || lives <= 0) return;
+
+            // ZOMBIES
+            zombies.forEach(zombie => {
+                const zPos = zombie.marker.getLatLng();
+                const dist = Math.sqrt(Math.pow(zPos.lat - playerPos.lat, 2) + Math.pow(zPos.lng - playerPos.lng, 2));
+
+                // Détection
+                if (zombie.state === 'WANDERING') {
+                    if (dist < playerMarker.detectionRadius) {
+                        zombie.state = 'CHASING';
+                    }
+                }
+
+                // Mouvement
+                if (zombie.state === 'CHASING') {
+                    // Si trop loin, on arrête
+                    if (dist > DETECTION_LOUD * 1.5) {
+                        zombie.state = 'WANDERING';
+                    } else {
+                        // Avance vers le joueur
+                        const angle = Math.atan2(playerPos.lng - zPos.lng, playerPos.lat - zPos.lat);
+                        const newLat = zPos.lat + Math.cos(angle) * zombie.speed;
+                        const newLng = zPos.lng + Math.sin(angle) * zombie.speed;
+                        zombie.marker.setLatLng([newLat, newLng]);
+
+                        // Collision (Mort)
+                        if (dist < 0.00005) { // ~5m
+                            lives--;
+                            updateLives();
+                            // Reculer le zombie
+                            zombie.marker.setLatLng([zPos.lat - 0.0005, zPos.lng - 0.0005]);
+                        }
+                    }
+                }
+            });
+
+            // OBJECTIFS
+            for (let i = objectives.length - 1; i >= 0; i--) {
+                const oPos = objectives[i].getLatLng();
+                const dist = Math.sqrt(Math.pow(oPos.lat - playerPos.lat, 2) + Math.pow(oPos.lng - playerPos.lng, 2));
+                
+                if (dist < 0.0002) { // ~20m
+                    map.removeLayer(objectives[i]);
+                    objectives.splice(i, 1);
+                    score++;
+                    document.getElementById('score').innerText = score + " / 5";
+                    
+                    if (score === 5) spawnExtraction();
+                }
+            }
+
+            // EXTRACTION
+            if (extractionMarker) {
+                const ePos = extractionMarker.getLatLng();
+                const dist = Math.sqrt(Math.pow(ePos.lat - playerPos.lat, 2) + Math.pow(ePos.lng - playerPos.lng, 2));
+                if (dist < 0.0002) {
+                    alert("VICTOIRE ! Tu as survécu.");
+                    gameRunning = false;
+                    location.reload();
+                }
+            }
+        }
+
+        function spawnExtraction() {
+            const lat = playerPos.lat + (Math.random() - 0.5) * 0.01;
+            const lng = playerPos.lng + (Math.random() - 0.5) * 0.01;
+            extractionMarker = L.marker([lat, lng], {icon: iconExit}).addTo(map);
+            alert("EXTRACTION DISPONIBLE ! Trouve le drapeau blanc !");
+        }
+
+        function updateLives() {
+            let hearts = "";
+            for(let i=0; i<lives; i++) hearts += "❤";
+            document.getElementById('lives').innerText = hearts;
+            if(lives <= 0) {
+                alert("GAME OVER...");
+                location.reload();
+            }
+        }
+
+        function updateTimer() {
+            if(!gameRunning) return;
+            const diff = Math.floor((Date.now() - startTime) / 1000);
+            const m = Math.floor(diff / 60).toString().padStart(2, '0');
+            const s = (diff % 60).toString().padStart(2, '0');
+            document.getElementById('timer').innerText = `${m}:${s}`;
+        }
+
+        function handleError(err) {
+            console.warn('ERROR(' + err.code + '): ' + err.message);
+        }
+
+        initMap();
+
+    </script>
+</body>
+</html>
