@@ -2,10 +2,14 @@ package com.example.zombie_map
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -14,6 +18,7 @@ import android.os.Vibrator
 import android.preference.PreferenceManager
 import android.view.View
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.RadioButton
 import android.widget.TextView
 import android.widget.Toast
@@ -21,6 +26,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.slider.Slider
@@ -32,8 +38,11 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import kotlin.math.cos
 import kotlin.math.pow
@@ -41,29 +50,47 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-// --- CLASSES ---
-class Zombie(val marker: Marker) {
+enum class ZombieState { WANDERING, CHASING }
+
+class Zombie(val marker: Marker, val spawnLocation: GeoPoint) {
+    var state = ZombieState.WANDERING
     var path: ArrayList<GeoPoint>? = null
     var pathIndex: Int = 0
     var isCalculating: Boolean = false
     var lastCalcTime: Long = 0
+    var wanderTarget: GeoPoint? = null
 }
 
-class SafeZone(val center: GeoPoint, val radius: Double, val polygon: Polygon)
+// Nouvelle classe pour gérer le Marker ET le Halo bleu ensemble
+class Objective(val marker: Marker, val halo: Polygon)
 
 class MainActivity : AppCompatActivity() {
 
-    // UI ELEMENTS
+    // UI
     private lateinit var map: MapView
     private lateinit var locationOverlay: MyLocationNewOverlay
-    private lateinit var txtTimer: TextView
-    private lateinit var btnPause: Button
-    private lateinit var btnMenu: Button
-    private lateinit var gameUIContainer: View
 
+    // HUD
+    private lateinit var gameUIContainer: View
+    private lateinit var topControls: View
+    private lateinit var bottomHud: View
+    private lateinit var pauseOverlay: View // L'écran avec le gros bouton Reprendre
+    private lateinit var btnResume: Button
+
+    private lateinit var txtTimer: TextView
+    private lateinit var txtObjectives: TextView
+    private lateinit var btnPause: View
+    private lateinit var btnStop: View
+    private lateinit var heart1: ImageView
+    private lateinit var heart2: ImageView
+    private lateinit var heart3: ImageView
+
+    // MENU
     private lateinit var menuContainer: View
     private lateinit var menuContent: View
     private lateinit var btnPlay: Button
+    private lateinit var btnShare: Button
+    private lateinit var lblResult: TextView
     private lateinit var radioEasy: RadioButton
     private lateinit var radioNormal: RadioButton
     private lateinit var radioHard: RadioButton
@@ -74,45 +101,64 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var vibrator: Vibrator
 
-    // GAME DATA
+    // DATA
     private val zombies = ArrayList<Zombie>()
-    private val objectives = ArrayList<Marker>()
-    private val safeZones = ArrayList<SafeZone>()
+    private val objectives = ArrayList<Objective>() // On stocke des objets complets maintenant
     private var extractionMarker: Marker? = null
+    private var extractionHalo: Polygon? = null
+    private var playerPathLine: Polyline? = null
 
-    private val handler = Handler(Looper.getMainLooper())
     private var gameRunning = false
     private var isPaused = false
     private var startTime = 0L
     private var timeInPause = 0L
     private var score = 0
-    private var lastGlobalApiCallTime = 0L // File d'attente serveur
-    private var lastVibrationTime = 0L
+    private var lives = 3
+    private var lastPos: GeoPoint? = null
+    private var distanceTraveled = 0.0
 
-    // DEFAULT PARAMS
+    // PARAMETRES
     private var GAME_RADIUS = 500.0
-    private var ZOMBIE_COUNT = 10
-    private var OBJECTIVE_COUNT = 5
-    private val SAFE_ZONE_RADIUS = 35.0
-    private var ZOMBIE_SPEED = 0.0000008
+    private var OBJECTIVE_TOTAL = 5
+    private var ZOMBIE_COUNT = 30
+    private var ZOMBIE_SPEED_CHASE = 0.0000020
+    private var ZOMBIE_SPEED_WANDER = 0.0000008
+    private val DETECTION_RADIUS = 0.0009
+    private val WANDER_RADIUS = 0.0027
+
+    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge() // Plein écran moderne
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-
         Configuration.getInstance().load(applicationContext, PreferenceManager.getDefaultSharedPreferences(applicationContext))
         setContentView(R.layout.activity_main)
 
-        // Init Views
+        // BINDINGS
+        map = findViewById(R.id.map)
         gameUIContainer = findViewById(R.id.gameUIContainer)
+        topControls = findViewById(R.id.topControls)
+        bottomHud = findViewById(R.id.bottomHud)
+
+        pauseOverlay = findViewById(R.id.pauseOverlay)
+        btnResume = findViewById(R.id.btnResume)
+
         menuContainer = findViewById(R.id.menuContainer)
         menuContent = findViewById(R.id.menuContent)
-        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-        map = findViewById(R.id.map)
+
         txtTimer = findViewById(R.id.txtTimer)
+        txtObjectives = findViewById(R.id.txtObjectives)
+        heart1 = findViewById(R.id.heart1)
+        heart2 = findViewById(R.id.heart2)
+        heart3 = findViewById(R.id.heart3)
+
         btnPause = findViewById(R.id.btnPause)
-        btnMenu = findViewById(R.id.btnMenu)
+        btnStop = findViewById(R.id.btnStop)
+
         btnPlay = findViewById(R.id.btnPlay)
+        btnShare = findViewById(R.id.btnShare)
+        lblResult = findViewById(R.id.lblResult)
+
         radioEasy = findViewById(R.id.radioEasy)
         radioNormal = findViewById(R.id.radioNormal)
         radioHard = findViewById(R.id.radioHard)
@@ -121,34 +167,44 @@ class MainActivity : AppCompatActivity() {
         lblRadius = findViewById(R.id.lblRadius)
         lblObjectives = findViewById(R.id.lblObjectives)
 
-        // GESTION INSETS (Empêche l'interface de passer sous la caméra/encoche)
-        ViewCompat.setOnApplyWindowInsetsListener(menuContent) { view, insets ->
+        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+
+        // INSETS (Marges auto)
+        ViewCompat.setOnApplyWindowInsetsListener(menuContent) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            view.setPadding(bars.left + 24, bars.top + 24, bars.right + 24, bars.bottom + 24)
+            v.setPadding(bars.left + 24, bars.top + 24, bars.right + 24, bars.bottom + 24)
             insets
         }
-        ViewCompat.setOnApplyWindowInsetsListener(gameUIContainer) { view, insets ->
+        ViewCompat.setOnApplyWindowInsetsListener(topControls) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            view.setPadding(bars.left + 16, bars.top + 16, bars.right + 16, bars.bottom + 16)
+            v.setPadding(v.paddingLeft, bars.top + v.paddingTop, v.paddingRight, v.paddingBottom)
+            insets
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(bottomHud) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(v.paddingLeft, v.paddingTop, v.paddingRight, bars.bottom + v.paddingBottom)
             insets
         }
 
-        // Config Map
+        // MAP SETUP
         map.setTileSource(TileSourceFactory.MAPNIK)
         map.setMultiTouchControls(true)
-        map.controller.setZoom(18.0)
+        map.controller.setZoom(19.0)
         map.controller.setCenter(GeoPoint(48.8583, 2.2944))
-        applyNightMode()
 
-        // Sliders Listeners
-        seekRadius.addOnChangeListener { _, value, _ ->
-            lblRadius.text = "ZONE DE JEU: ${value.toInt()}m"
-        }
-        seekObjectives.addOnChangeListener { _, value, _ ->
-            lblObjectives.text = "OBJECTIFS: ${value.toInt()}"
-        }
+        // Filtre sombre
+        val inverseMatrix = floatArrayOf(
+            0.6f, 0f, 0f, 0f, 0f,
+            0f, 0.6f, 0f, 0f, 0f,
+            0f, 0f, 0.6f, 0f, 0f,
+            0f, 0f, 0f, 1f, 0f
+        )
+        map.overlayManager.tilesOverlay.setColorFilter(ColorMatrixColorFilter(ColorMatrix(inverseMatrix)))
 
-        // Buttons
+        // LISTENERS
+        seekRadius.addOnChangeListener { _, value, _ -> lblRadius.text = "ZONE: ${value.toInt()}m" }
+        seekObjectives.addOnChangeListener { _, value, _ -> lblObjectives.text = "OBJECTIFS: ${value.toInt()}" }
+
         btnPlay.setOnClickListener {
             readMenuSettings()
             menuContainer.visibility = View.GONE
@@ -156,188 +212,349 @@ class MainActivity : AppCompatActivity() {
             spawnGame()
         }
 
-        btnMenu.setOnClickListener {
-            gameRunning = false
-            handler.removeCallbacks(gameLoop)
-            gameUIContainer.visibility = View.GONE
-            menuContainer.visibility = View.VISIBLE
-        }
+        btnShare.setOnClickListener { shareGameResult() }
 
+        // PAUSE LOGIC
         btnPause.setOnClickListener { togglePause() }
+        btnResume.setOnClickListener { togglePause() }
+
+        // ABANDON
+        btnStop.setOnClickListener { gameOver(false) }
 
         checkPermissionsAndStartGps()
-    }
-
-    private fun readMenuSettings() {
-        if (radioEasy.isChecked) {
-            ZOMBIE_COUNT = 10
-            ZOMBIE_SPEED = 0.0000008 // Marche lente
-        } else if (radioNormal.isChecked) {
-            ZOMBIE_COUNT = 15
-            ZOMBIE_SPEED = 0.0000018 // Jogging
-        } else {
-            ZOMBIE_COUNT = 20
-            ZOMBIE_SPEED = 0.0000035 // Sprint
-        }
-        GAME_RADIUS = seekRadius.value.toDouble()
-        OBJECTIVE_COUNT = seekObjectives.value.toInt()
-    }
-
-    private fun applyNightMode() {
-        // Matrice pour inverser les couleurs (Effet Radar)
-        val inverseMatrix = floatArrayOf(
-            -1.0f, 0.0f, 0.0f, 0.0f, 255f,
-            0.0f, -1.0f, 0.0f, 0.0f, 255f,
-            0.0f, 0.0f, -1.0f, 0.0f, 255f,
-            0.0f, 0.0f, 0.0f, 1.0f, 0.0f
-        )
-        map.overlayManager.tilesOverlay.setColorFilter(ColorMatrixColorFilter(ColorMatrix(inverseMatrix)))
     }
 
     private fun togglePause() {
         if (!gameRunning) return
         isPaused = !isPaused
+
         if (isPaused) {
-            btnPause.text = "REPRENDRE"
-            btnPause.background.setTint(Color.GREEN)
+            // Afficher l'écran pause
+            pauseOverlay.visibility = View.VISIBLE
+            timeInPause = System.currentTimeMillis()
         } else {
-            btnPause.text = "PAUSE"
-            btnPause.background.setTint(Color.parseColor("#FFB300"))
+            // Cacher l'écran pause
+            pauseOverlay.visibility = View.GONE
             startTime += (System.currentTimeMillis() - timeInPause)
+            handler.post(gameLoop)
         }
-        timeInPause = System.currentTimeMillis()
     }
 
-    // --- LOGIQUE SPAWN ---
+    private fun readMenuSettings() {
+        if (radioEasy.isChecked) {
+            ZOMBIE_COUNT = 10
+            ZOMBIE_SPEED_CHASE = 0.0000010
+        } else if (radioNormal.isChecked) {
+            ZOMBIE_COUNT = 30
+            ZOMBIE_SPEED_CHASE = 0.0000022
+        } else {
+            ZOMBIE_COUNT = 50
+            ZOMBIE_SPEED_CHASE = 0.0000045
+        }
+        GAME_RADIUS = seekRadius.value.toDouble()
+        OBJECTIVE_TOTAL = seekObjectives.value.toInt()
+    }
+
     private fun spawnGame() {
         if (!::locationOverlay.isInitialized || locationOverlay.myLocation == null) {
-            Toast.makeText(this, "Attends le signal GPS !", Toast.LENGTH_SHORT).show()
-            gameUIContainer.visibility = View.GONE
+            Toast.makeText(this, "Attends le GPS...", Toast.LENGTH_SHORT).show()
             menuContainer.visibility = View.VISIBLE
+            gameUIContainer.visibility = View.GONE
             return
         }
 
         val myPos = locationOverlay.myLocation
 
-        map.overlays.removeAll { it is Marker || it is Polygon }
+        // Reset
+        map.overlays.removeAll { it is Marker || it is Polyline || it is Polygon }
+        map.overlays.add(locationOverlay)
         zombies.clear()
         objectives.clear()
-        safeZones.clear()
         extractionMarker = null
+        extractionHalo = null
         score = 0
+        lives = 3
+        distanceTraveled = 0.0
+        lastPos = myPos
         isPaused = false
-        btnPause.text = "PAUSE"
+        pauseOverlay.visibility = View.GONE
 
-        drawGameBoundary(myPos)
+        updateHud()
 
-        for (i in 1..3) createSafeZoneStrictlyInside(myPos)
-        for (i in 1..OBJECTIVE_COUNT) spawnSmartObjectiveInside(i, myPos)
+        // Traceur
+        playerPathLine = Polyline()
+        playerPathLine?.outlinePaint?.color = Color.CYAN
+        playerPathLine?.outlinePaint?.strokeWidth = 8f
+        map.overlays.add(0, playerPathLine)
 
-        // Spawn progressif pour ne pas surcharger le serveur OSRM
+        // 1. Spawn Objectifs
+        for (i in 1..OBJECTIVE_TOTAL) spawnSmartObjective(i, myPos)
+
+        // 2. Spawn Zombies
         for (i in 1..ZOMBIE_COUNT) {
-            handler.postDelayed({
-                if (gameRunning) spawnSmartZombieInside(myPos)
-            }, (i * 300).toLong())
+            val angle = Random.nextDouble() * 2 * Math.PI
+            val dist = 0.0005 + Random.nextDouble() * (GAME_RADIUS / 111319.0)
+            val zLat = myPos.latitude + dist * cos(angle)
+            val zLon = myPos.longitude + dist * sin(angle)
+            createZombie(GeoPoint(zLat, zLon))
         }
 
-        map.overlays.add(locationOverlay)
-        map.invalidate()
+        // 3. Spawn Extraction (VERROUILLÉE AU DÉBUT)
+        spawnExtraction(myPos, locked = true)
 
+        map.invalidate()
         startTime = System.currentTimeMillis()
         gameRunning = true
         handler.removeCallbacks(gameLoop)
         handler.post(gameLoop)
 
-        Toast.makeText(this, "SURVIS ! ${OBJECTIVE_COUNT} OBJECTIFS", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "RÉCUPÈRE LES $OBJECTIVE_TOTAL SACS !", Toast.LENGTH_LONG).show()
     }
 
-    // --- MOUVEMENT & INTELLIGENCE ---
-    private fun moveZombie(zombie: Zombie, target: GeoPoint) {
-        val currentTime = System.currentTimeMillis()
+    // --- ICI EST LA CORRECTION : spawnExtraction est sortie de spawnGame ---
+    private fun spawnExtraction(center: GeoPoint, locked: Boolean) {
+        // Si l'extraction existe déjà (on la met juste à jour), on garde la même position
+        val pos: GeoPoint
+        if (extractionMarker != null) {
+            pos = extractionMarker!!.position
+            map.overlays.remove(extractionMarker) // On enlève l'ancien marker
+            if (extractionHalo != null) map.overlays.remove(extractionHalo) // On enlève l'ancien halo
+        } else {
+            // Sinon on calcule une nouvelle position loin
+            val angle = Random.nextDouble() * 2 * Math.PI
+            val dist = 0.004 // Environ 400m
+            val lat = center.latitude + dist * cos(angle)
+            val lon = center.longitude + dist * sin(angle)
+            pos = GeoPoint(lat, lon)
+        }
 
+        // 1. Création du Marker
+        extractionMarker = Marker(map)
+        extractionMarker?.position = pos
+        extractionMarker?.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+
+        if (locked) {
+            // ÉTAT VERROUILLÉ (Rouge)
+            extractionMarker?.title = "EXTRACTION (VERROUILLÉE)"
+            // On utilise ton image, mais on la teinte en ROUGE
+            val icon = ContextCompat.getDrawable(this, R.drawable.ic_extraction_pin)?.mutate()
+            icon?.setTint(Color.RED)
+            extractionMarker?.icon = icon
+        } else {
+            // ÉTAT OUVERT (Vert + Halo)
+            extractionMarker?.title = "EXTRACTION (OUVERTE)"
+            val icon = ContextCompat.getDrawable(this, R.drawable.ic_extraction_pin)?.mutate()
+            icon?.setTint(Color.GREEN)
+            extractionMarker?.icon = icon
+
+            // Ajout du Halo Vert pour dire "C'est ici !"
+            val haloPoints = ArrayList<GeoPoint>()
+            val radiusMeters = 30.0
+            for (i in 0..360 step 10) {
+                haloPoints.add(GeoPoint(
+                    pos.latitude + (radiusMeters / 111319f) * cos(Math.toRadians(i.toDouble())),
+                    pos.longitude + (radiusMeters / (111319f * cos(Math.toRadians(pos.latitude)))) * sin(Math.toRadians(i.toDouble()))
+                ))
+            }
+            extractionHalo = Polygon()
+            extractionHalo?.points = haloPoints
+            extractionHalo?.fillPaint?.color = Color.argb(60, 0, 255, 0)
+            extractionHalo?.outlinePaint?.color = Color.GREEN
+            map.overlays.add(0, extractionHalo)
+
+            Toast.makeText(this, "EXTRACTION DÉVERROUILLÉE ! FONCE !", Toast.LENGTH_LONG).show()
+            vibrator.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
+        }
+
+        map.overlays.add(extractionMarker)
+    }
+
+    private fun updateHud() {
+        txtObjectives.text = "$score/$OBJECTIVE_TOTAL"
+        heart1.visibility = if (lives >= 1) View.VISIBLE else View.INVISIBLE
+        heart2.visibility = if (lives >= 2) View.VISIBLE else View.INVISIBLE
+        heart3.visibility = if (lives >= 3) View.VISIBLE else View.INVISIBLE
+    }
+
+    private val gameLoop = object : Runnable {
+        override fun run() {
+            if (!gameRunning) return
+            if (isPaused) return // On arrête la boucle si pause
+
+            val now = System.currentTimeMillis()
+            val millis = now - startTime
+            val seconds = (millis / 1000).toInt()
+            txtTimer.text = String.format("%02d:%02d", seconds / 60, seconds % 60)
+
+            val myPos = locationOverlay.myLocation ?: return
+
+            // Traceur
+            if (lastPos != null && distance(lastPos!!, myPos) > 0.000005) {
+                playerPathLine?.addPoint(myPos)
+                lastPos = myPos
+            }
+
+            // Zombies
+            for (zombie in zombies) {
+                val distToPlayer = distance(zombie.marker.position, myPos)
+                if (zombie.state == ZombieState.WANDERING && distToPlayer < DETECTION_RADIUS) {
+                    zombie.state = ZombieState.CHASING
+                    zombie.path = null
+                }
+
+                if (zombie.state == ZombieState.CHASING) {
+                    moveChasing(zombie, myPos)
+                    if (distToPlayer < 0.00005) {
+                        playerHit(zombie)
+                        if (lives <= 0) return
+                    }
+                } else {
+                    moveWandering(zombie)
+                }
+            }
+
+            // GESTION DES OBJECTIFS
+            val collected = ArrayList<Objective>()
+            for (obj in objectives) {
+                if (distance(myPos, obj.marker.position) < 0.00015) collected.add(obj)
+            }
+            for (obj in collected) {
+                map.overlays.remove(obj.marker)
+                map.overlays.remove(obj.halo)
+                objectives.remove(obj)
+                score++
+                updateHud()
+                vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+
+                // SI ON A TOUT : DÉVERROUILLER L'EXTRACTION (Passer en vert)
+                if (score == OBJECTIVE_TOTAL) {
+                    // On ne crée pas une nouvelle, on met à jour l'existante
+                    spawnExtraction(myPos, locked = false)
+                }
+            }
+
+            // GESTION DE LA FIN (EXTRACTION)
+            if (extractionMarker != null && distance(myPos, extractionMarker!!.position) < 0.00015) {
+                if (score >= OBJECTIVE_TOTAL) {
+                    // C'EST GAGNÉ
+                    gameOver(true)
+                    return
+                } else {
+                    // ON EST ARRIVÉ MAIS PAS FINI
+                    val missing = OBJECTIVE_TOTAL - score
+                    // On peut ajouter un Toast ici, mais attention à ne pas spammer
+                    // Toast.makeText(applicationContext, "Verrouillé ! Il manque $missing objectifs.", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            map.invalidate()
+            handler.postDelayed(this, 100)
+        }
+    }
+
+    private fun spawnSmartObjective(index: Int, center: GeoPoint) {
+        val angle = Random.nextDouble() * 2 * Math.PI
+        val dist = 0.001 + Random.nextDouble() * 0.003
+        val lat = center.latitude + dist * cos(angle)
+        val lon = center.longitude + dist * sin(angle)
+
+        val pos = GeoPoint(lat, lon)
+
+        // 1. Créer le Halo Bleu
+        val haloPoints = ArrayList<GeoPoint>()
+        val radiusMeters = 20.0 // 20m de rayon pour le visuel
+        for (i in 0..360 step 10) {
+            haloPoints.add(GeoPoint(
+                lat + (radiusMeters / 111319f) * cos(Math.toRadians(i.toDouble())),
+                lon + (radiusMeters / (111319f * cos(Math.toRadians(lat)))) * sin(Math.toRadians(i.toDouble()))
+            ))
+        }
+        val halo = Polygon()
+        halo.points = haloPoints
+        halo.fillPaint.color = Color.argb(60, 0, 100, 255) // Bleu transparent
+        halo.outlinePaint.color = Color.BLUE
+        halo.outlinePaint.strokeWidth = 2f
+
+        // 2. Créer le Marker
+        val checkpoint = Marker(map)
+        checkpoint.position = pos
+        checkpoint.icon = ContextCompat.getDrawable(this, R.drawable.ic_bag)
+        checkpoint.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+
+        // 3. Ajouter dans l'ordre (Halo SOUS le sac)
+        map.overlays.add(0, halo)
+        map.overlays.add(checkpoint)
+
+        objectives.add(Objective(checkpoint, halo))
+    }
+
+    private fun playerHit(zombie: Zombie) {
+        val angle = Random.nextDouble() * 2 * Math.PI
+        val pushBackDist = 0.0003
+        zombie.marker.position = GeoPoint(zombie.marker.position.latitude + pushBackDist * cos(angle), zombie.marker.position.longitude + pushBackDist * sin(angle))
+        zombie.path = null
+        lives--
+        updateHud()
+        vibrator.vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
+        Toast.makeText(this, "TOUCHÉ ! Vies: $lives", Toast.LENGTH_SHORT).show()
+        if (lives <= 0) gameOver(false)
+    }
+
+    private fun createZombie(pos: GeoPoint) {
+        val zMarker = Marker(map)
+        zMarker.position = pos
+        zMarker.icon = ContextCompat.getDrawable(this, R.drawable.ic_zombie_circle)
+        zMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+        map.overlays.add(zMarker)
+        zombies.add(Zombie(zMarker, pos))
+    }
+
+    private fun moveChasing(zombie: Zombie, target: GeoPoint) {
         if (zombie.path == null || zombie.pathIndex >= zombie.path!!.size) {
             if (!zombie.isCalculating) {
-                // File d'attente serveur (1200ms)
-                if (currentTime - lastGlobalApiCallTime > 1200) {
-                    lastGlobalApiCallTime = currentTime
-                    zombie.lastCalcTime = currentTime
+                val now = System.currentTimeMillis()
+                if (now - zombie.lastCalcTime > 2000) {
+                    zombie.lastCalcTime = now
                     getRouteForZombie(zombie, target)
                 } else {
-                    // Fallback : Marche tout droit
-                    moveLinearly(zombie, target, ZOMBIE_SPEED * 0.5)
+                    moveLinearly(zombie, target, ZOMBIE_SPEED_CHASE)
                 }
             }
         } else {
-            val nextPoint = zombie.path!![zombie.pathIndex]
-            val distToNext = distance(zombie.marker.position, nextPoint)
-            if (distToNext < ZOMBIE_SPEED) {
-                zombie.marker.position = nextPoint
+            val next = zombie.path!![zombie.pathIndex]
+            if (distance(zombie.marker.position, next) < ZOMBIE_SPEED_CHASE) {
+                zombie.marker.position = next
                 zombie.pathIndex++
             } else {
-                val ratio = ZOMBIE_SPEED / distToNext
-                val newLat = zombie.marker.position.latitude + (nextPoint.latitude - zombie.marker.position.latitude) * ratio
-                val newLon = zombie.marker.position.longitude + (nextPoint.longitude - zombie.marker.position.longitude) * ratio
-                zombie.marker.position = GeoPoint(newLat, newLon)
+                moveLinearly(zombie, next, ZOMBIE_SPEED_CHASE)
             }
+        }
+    }
+
+    private fun moveWandering(zombie: Zombie) {
+        if (zombie.wanderTarget == null) {
+            val angle = Random.nextDouble() * 2 * Math.PI
+            val dist = Random.nextDouble() * WANDER_RADIUS
+            val wLat = zombie.spawnLocation.latitude + dist * cos(angle)
+            val wLon = zombie.spawnLocation.longitude + dist * sin(angle)
+            zombie.wanderTarget = GeoPoint(wLat, wLon)
+        }
+        val target = zombie.wanderTarget!!
+        if (distance(zombie.marker.position, target) < ZOMBIE_SPEED_WANDER) {
+            if (Random.nextBoolean()) zombie.wanderTarget = null
+        } else {
+            moveLinearly(zombie, target, ZOMBIE_SPEED_WANDER)
         }
     }
 
     private fun moveLinearly(zombie: Zombie, target: GeoPoint, speed: Double) {
         val distTotal = distance(zombie.marker.position, target)
-        if (distTotal > speed) {
+        if (distTotal > 0) {
             val ratio = speed / distTotal
             val newLat = zombie.marker.position.latitude + (target.latitude - zombie.marker.position.latitude) * ratio
             val newLon = zombie.marker.position.longitude + (target.longitude - zombie.marker.position.longitude) * ratio
             zombie.marker.position = GeoPoint(newLat, newLon)
         }
-    }
-
-    // --- SERVER API CALLS ---
-    private fun spawnSmartZombieInside(centerRef: GeoPoint) {
-        val angle = Random.nextDouble() * 2 * Math.PI
-        val maxDistDegrees = GAME_RADIUS / 111319.0
-        val dist = (0.2 + Random.nextDouble() * 0.7) * maxDistDegrees
-        val rawLat = centerRef.latitude + dist * cos(angle)
-        val rawLon = centerRef.longitude + dist * sin(angle)
-
-        callOsrmNearest(rawLat, rawLon) { point -> createZombieMarker(point) }
-    }
-
-    private fun spawnSmartObjectiveInside(index: Int, centerRef: GeoPoint) {
-        val angle = Random.nextDouble() * 2 * Math.PI
-        val maxDistDegrees = GAME_RADIUS / 111319.0
-        val dist = Random.nextDouble() * maxDistDegrees
-        val rawLat = centerRef.latitude + dist * cos(angle)
-        val rawLon = centerRef.longitude + dist * sin(angle)
-
-        callOsrmNearest(rawLat, rawLon) { point -> createMarkerObjective(index, point) }
-    }
-
-    // Factorisation de l'appel "Nearest"
-    private fun callOsrmNearest(lat: Double, lon: Double, callback: (GeoPoint) -> Unit) {
-        val client = OkHttpClient()
-        val url = "https://router.project-osrm.org/nearest/v1/walking/$lon,$lat?number=1"
-        val request = Request.Builder().url(url).header("User-Agent", "ZombieApp/1.0").build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                runOnUiThread { callback(GeoPoint(lat, lon)) }
-            }
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    response.body?.string()?.let { jsonString ->
-                        val json = JSONObject(jsonString)
-                        val waypoints = json.optJSONArray("waypoints")
-                        var finalPoint = GeoPoint(lat, lon)
-                        if (waypoints != null && waypoints.length() > 0) {
-                            val location = waypoints.getJSONObject(0).getJSONArray("location")
-                            finalPoint = GeoPoint(location.getDouble(1), location.getDouble(0))
-                        }
-                        runOnUiThread { callback(finalPoint) }
-                    }
-                } catch (e: Exception) { runOnUiThread { callback(GeoPoint(lat, lon)) } }
-            }
-        })
     }
 
     private fun getRouteForZombie(zombie: Zombie, target: GeoPoint) {
@@ -346,7 +563,6 @@ class MainActivity : AppCompatActivity() {
         val client = OkHttpClient()
         val url = "https://router.project-osrm.org/route/v1/walking/${start.longitude},${start.latitude};${target.longitude},${target.latitude}?overview=full&geometries=geojson"
         val request = Request.Builder().url(url).header("User-Agent", "ZombieApp/1.0").build()
-
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { zombie.isCalculating = false }
             override fun onResponse(call: Call, response: Response) {
@@ -374,180 +590,42 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // --- MARKER CREATION ---
-    private fun createZombieMarker(pos: GeoPoint) {
-        if (!gameRunning) return
-        val zMarker = Marker(map)
-        zMarker.position = pos
-        zMarker.title = "ZOMBIE"
-        zMarker.icon = ContextCompat.getDrawable(this, R.drawable.ic_zombie_circle)
-        zMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-        map.overlays.add(zMarker)
-        zombies.add(Zombie(zMarker))
-        map.invalidate()
-    }
-
-    private fun createMarkerObjective(index: Int, pos: GeoPoint) {
-        val checkpoint = Marker(map)
-        checkpoint.position = pos
-        checkpoint.title = "Objectif $index"
-        checkpoint.icon = ContextCompat.getDrawable(this, R.drawable.ic_objective_pin)
-        map.overlays.add(checkpoint)
-        objectives.add(checkpoint)
-        map.invalidate()
-    }
-
-    // --- HELPERS (Zones, Boundaries, Distances) ---
-    private fun drawGameBoundary(center: GeoPoint) {
-        val circlePoints = ArrayList<GeoPoint>()
-        for (i in 0..360 step 5) {
-            circlePoints.add(GeoPoint(center.latitude + (GAME_RADIUS / 111319f) * cos(Math.toRadians(i.toDouble())),
-                center.longitude + (GAME_RADIUS / (111319f * cos(Math.toRadians(center.latitude)))) * sin(Math.toRadians(i.toDouble()))))
-        }
-        val boundary = Polygon()
-        boundary.points = circlePoints
-        boundary.fillPaint.color = Color.TRANSPARENT
-        boundary.outlinePaint.color = Color.RED
-        boundary.outlinePaint.strokeWidth = 5f
-        map.overlays.add(0, boundary)
-    }
-
-    private fun createSafeZoneStrictlyInside(centerRef: GeoPoint) {
-        val angle = Random.nextDouble() * 2 * Math.PI
-        val maxDistAvailable = GAME_RADIUS - SAFE_ZONE_RADIUS
-        val maxDistDegrees = maxDistAvailable / 111319.0
-        val dist = (0.2 + Random.nextDouble() * 0.8) * maxDistDegrees
-        val zoneLat = centerRef.latitude + dist * cos(angle)
-        val zoneLon = centerRef.longitude + dist * sin(angle)
-        val center = GeoPoint(zoneLat, zoneLon)
-
-        val circlePoints = ArrayList<GeoPoint>()
-        for (i in 0..360 step 10) {
-            circlePoints.add(GeoPoint(zoneLat + (SAFE_ZONE_RADIUS / 111319f) * cos(Math.toRadians(i.toDouble())),
-                zoneLon + (SAFE_ZONE_RADIUS / (111319f * cos(Math.toRadians(zoneLat)))) * sin(Math.toRadians(i.toDouble()))))
-        }
-        val zonePoly = Polygon()
-        zonePoly.points = circlePoints
-        zonePoly.fillPaint.color = Color.argb(60, 0, 255, 0)
-        zonePoly.outlinePaint.color = Color.GREEN
-        map.overlays.add(0, zonePoly)
-        safeZones.add(SafeZone(center, SAFE_ZONE_RADIUS, zonePoly))
-    }
-
-    private fun spawnExtraction(myPos: GeoPoint) {
-        val angle = Random.nextDouble() * 2 * Math.PI
-        val maxDistDegrees = GAME_RADIUS / 111319.0
-        val dist = (0.85 + Random.nextDouble() * 0.1) * maxDistDegrees
-        val exLat = myPos.latitude + dist * cos(angle)
-        val exLon = myPos.longitude + dist * sin(angle)
-
-        extractionMarker = Marker(map)
-        extractionMarker?.position = GeoPoint(exLat, exLon)
-        extractionMarker?.title = "EXTRACTION"
-        extractionMarker?.icon = ContextCompat.getDrawable(this, R.drawable.ic_extraction_pin)
-        map.overlays.add(extractionMarker)
-        map.invalidate()
-        Toast.makeText(applicationContext, "EXTRACTION DISPONIBLE !", Toast.LENGTH_LONG).show()
-    }
-
-    // --- BOUCLE DE JEU ---
-    private val gameLoop = object : Runnable {
-        override fun run() {
-            if (!gameRunning) return
-
-            if (isPaused) {
-                timeInPause = System.currentTimeMillis()
-                handler.postDelayed(this, 100)
-                return
-            }
-
-            val millis = System.currentTimeMillis() - startTime
-            val seconds = (millis / 1000).toInt()
-            txtTimer.text = String.format("%02d:%02d", seconds / 60, seconds % 60)
-
-            val myPos = locationOverlay.myLocation
-
-            if (myPos != null) {
-                // Check Boundary
-                if (distance(myPos, map.mapCenter as GeoPoint) > (GAME_RADIUS / 111319.0)) {
-                    txtTimer.setTextColor(Color.RED)
-                    txtTimer.text = "HORS ZONE !"
-                } else {
-                    txtTimer.setTextColor(Color.WHITE)
-                }
-
-                // Check Safe Zone
-                var isSafe = false
-                for (zone in safeZones) {
-                    if (distance(myPos, zone.center) < (zone.radius / 111319.0)) {
-                        isSafe = true
-                        txtTimer.setTextColor(Color.GREEN)
-                        txtTimer.text = "SÉCURISÉ"
-                        break
-                    }
-                }
-
-                // Update Zombies
-                var closestZombieDist = 9999.0
-                for (zombie in zombies) {
-                    if (!isSafe) {
-                        moveZombie(zombie, myPos)
-                        val dist = distance(myPos, zombie.marker.position)
-                        if (dist < closestZombieDist) closestZombieDist = dist
-                        if (dist < 0.00008) {
-                            gameOver("TU ES MORT !")
-                            vibrator.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
-                            return
-                        }
-                    }
-                }
-                if (!isSafe) manageVibration(closestZombieDist)
-
-                // Update Objectives
-                val collected = ArrayList<Marker>()
-                for (obj in objectives) {
-                    if (distance(myPos, obj.position) < 0.0002) collected.add(obj)
-                }
-                for (obj in collected) {
-                    map.overlays.remove(obj)
-                    objectives.remove(obj)
-                    score++
-                    Toast.makeText(applicationContext, "Objectif ! ($score/$OBJECTIVE_COUNT)", Toast.LENGTH_SHORT).show()
-                    vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
-                    if (score == OBJECTIVE_COUNT) spawnExtraction(myPos)
-                }
-
-                if (extractionMarker != null) {
-                    if (distance(myPos, extractionMarker!!.position) < 0.0002) {
-                        gameOver("VICTOIRE !")
-                        return
-                    }
-                }
-                map.invalidate()
-            }
-            handler.postDelayed(this, 100)
-        }
-    }
-
-    private fun manageVibration(closestDist: Double) {
-        val currentTime = System.currentTimeMillis()
-        if (closestDist < 0.0002) {
-            if (currentTime - lastVibrationTime > 1000) {
-                vibrator.vibrate(VibrationEffect.createOneShot(200, 255))
-                lastVibrationTime = currentTime
-            }
-        } else if (closestDist < 0.0005) {
-            if (currentTime - lastVibrationTime > 2000) {
-                vibrator.vibrate(VibrationEffect.createOneShot(100, 100))
-                lastVibrationTime = currentTime
-            }
-        }
-    }
-
-    private fun gameOver(message: String) {
+    private fun gameOver(victory: Boolean) {
         gameRunning = false
-        Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
-        btnPause.text = "FINI"
+        gameUIContainer.visibility = View.GONE
+        pauseOverlay.visibility = View.GONE // Sécurité
+        menuContainer.visibility = View.VISIBLE
+        lblResult.visibility = View.VISIBLE
+        btnShare.visibility = View.VISIBLE
+
+        if (victory) {
+            lblResult.text = "VICTOIRE !\nTemps: ${txtTimer.text}"
+            lblResult.setTextColor(Color.GREEN)
+        } else {
+            lblResult.text = "GAME OVER"
+            lblResult.setTextColor(Color.RED)
+        }
+    }
+
+    private fun shareGameResult() {
+        val rootView = window.decorView.rootView
+        val bitmap = Bitmap.createBitmap(rootView.width, rootView.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        rootView.draw(canvas)
+        try {
+            val cachePath = File(externalCacheDir, "my_images/")
+            cachePath.mkdirs()
+            val file = File(cachePath, "zombie_run.png")
+            val stream = FileOutputStream(file)
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            stream.close()
+            val contentUri: Uri = FileProvider.getUriForFile(this, "$packageName.provider", file)
+            val shareIntent = Intent(Intent.ACTION_SEND)
+            shareIntent.type = "image/png"
+            shareIntent.putExtra(Intent.EXTRA_STREAM, contentUri)
+            shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(shareIntent, "Partager"))
+        } catch (e: IOException) { }
     }
 
     private fun distance(p1: GeoPoint, p2: GeoPoint): Double {
@@ -575,6 +653,7 @@ class MainActivity : AppCompatActivity() {
             setupLocationOverlay()
         }
     }
+
     override fun onResume() { super.onResume(); map.onResume() }
     override fun onPause() { super.onPause(); map.onPause() }
 }
